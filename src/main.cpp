@@ -1,0 +1,576 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <Preferences.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ArduinoJson.h>
+#include <TFT_eSPI.h>
+#include <time.h>
+
+#define TFT_BL_PIN  21
+#define CONFIG_BTN   0
+
+TFT_eSPI    tft = TFT_eSPI();
+Preferences prefs;
+WebServer   server(80);
+DNSServer   dnsServer;
+
+// Config portal state
+bool   portalWifiConnected = false;
+String tempSSID, tempPass, connectError;
+
+// Saved config (loaded from NVS on normal boot)
+String cfgSSID, cfgPass, cfgStationId, cfgStationName;
+
+const char* ntpServer = "pool.ntp.org";
+const char* timezone  = "EST5EDT,M3.2.0,M11.1.0";
+
+// Tide data
+JsonDocument tideDoc;
+JsonArray    predictions;
+float        minTide, maxTide;
+String       highTideEvents[2];
+String       lowTideEvents[2];
+int          dataDayOfYear = -1;
+
+// Forward declarations
+bool hasConfig();
+
+// ── Shared page chrome ────────────────────────────────────────────────────────
+
+static const char PAGE_STYLE[] =
+  "<style>"
+  "body{font-family:sans-serif;max-width:460px;margin:40px auto;padding:0 20px}"
+  "h1{color:#00aaff;margin-bottom:4px}"
+  "h2{color:#aaa;font-size:14px;font-weight:normal;margin-top:0}"
+  "label{display:block;margin-top:16px;font-weight:bold}"
+  "input[type=text],input[type=password]{"
+  "  width:100%;padding:9px;margin-top:4px;box-sizing:border-box;"
+  "  border:1px solid #ccc;border-radius:4px;font-size:15px}"
+  ".btn{display:block;margin-top:20px;width:100%;padding:13px;"
+  "  background:#00aaff;color:#fff;border:none;border-radius:4px;"
+  "  font-size:16px;cursor:pointer;text-align:center}"
+  ".err{color:#c00;margin-top:12px;padding:10px;background:#fee;"
+  "  border-radius:4px}"
+  ".station{padding:10px 12px;margin-top:8px;border:1px solid #ddd;"
+  "  border-radius:6px;cursor:pointer;background:#fafafa;color:#222}"
+  ".station:hover{background:#e8f4ff;border-color:#00aaff}"
+  ".station strong{display:block;color:#111}"
+  ".station small{color:#666}"
+  ".none{color:#888;margin-top:16px}"
+  "</style>";
+
+// ── Config portal — step 1: WiFi ──────────────────────────────────────────────
+
+void handleRoot() {
+  if (portalWifiConnected) {
+    server.sendHeader("Location", "/stations");
+    server.send(302);
+    return;
+  }
+  String html = "<!DOCTYPE html><html><head>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>MyTides Setup</title>";
+  html += PAGE_STYLE;
+  html += "</head><body>"
+    "<h1>MyTides Setup</h1>"
+    "<h2>Step 1 of 2 — WiFi</h2>"
+    "<form method='POST' action='/connect'>"
+    "<label>WiFi Network Name</label>"
+    "<input type='text' name='ssid' value='" + cfgSSID + "' required autocomplete='off'>"
+    "<label>WiFi Password</label>"
+    "<input type='password' name='pass' placeholder='(leave blank to keep saved)' autocomplete='off'>"
+    "<button class='btn' type='submit'>Connect &rarr;</button>";
+  if (connectError.length() > 0) {
+    html += "<p class='err'>" + connectError + "</p>";
+    connectError = "";
+  }
+  html += "</form></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleConnect() {
+  String ssid = server.arg("ssid");
+  String pass = server.arg("pass");
+  if (pass.length() == 0) pass = cfgPass; // keep saved password
+
+  // Show a "connecting" page while we try
+  server.send(200, "text/html",
+    "<!DOCTYPE html><html><head>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<meta http-equiv='refresh' content='12;url=/stations'>"
+    "<title>Connecting...</title>"
+    + String(PAGE_STYLE) +
+    "</head><body>"
+    "<h1>MyTides Setup</h1>"
+    "<h2>Connecting to <strong>" + ssid + "</strong>...</h2>"
+    "<p>This page will redirect automatically.</p>"
+    "</body></html>");
+
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawCentreString("Connecting to WiFi...", tft.width() / 2, tft.height() / 2, 2);
+
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 24) {
+    delay(500);
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    tempSSID = ssid;
+    tempPass = pass;
+    portalWifiConnected = true;
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.drawCentreString("WiFi Connected!", tft.width() / 2, 40, 4);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawCentreString("Search for your", tft.width() / 2, 90, 2);
+    tft.drawCentreString("tide station in browser", tft.width() / 2, 110, 2);
+  } else {
+    WiFi.disconnect();
+    connectError = "Could not connect to &ldquo;" + ssid + "&rdquo;. Check credentials.";
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.drawCentreString("WiFi Failed", tft.width() / 2, tft.height() / 2, 4);
+  }
+}
+
+// ── Config portal — step 2: Station search ────────────────────────────────────
+
+String buildStationResults(String query) {
+  query.trim();
+  if (query.length() == 0) {
+    return "<p class='err'>Please enter a city or station name.</p>";
+  }
+
+  String q = query; q.replace(" ", "%20");
+  String url = "https://tidesandcurrents.noaa.gov/mdapi/latest/webapi/tidepredstations.json?q=" + q;
+
+  WiFiClientSecure tls;
+  tls.setInsecure();
+  HTTPClient http;
+  http.begin(tls, url);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(15000);
+
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    return "<p class='err'>NOAA error: HTTP " + String(code) + "</p>";
+  }
+
+  String body = http.getString();
+  http.end();
+
+  if (body.length() == 0) return "<p class='err'>Empty response from NOAA.</p>";
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) return "<p class='err'>Parse error: " + String(err.c_str()) + "</p>";
+
+  JsonArray stations = doc["stationList"].as<JsonArray>();
+  if (stations.isNull()) stations = doc["stations"].as<JsonArray>();
+  if (stations.size() == 0) {
+    return "<p class='none'>No stations found for &ldquo;" + query + "&rdquo;.</p>";
+  }
+
+  String out;
+  int count = 0;
+  for (JsonObject s : stations) {
+    // Field names vary slightly between NOAA endpoints
+    String id    = s["stationId"] | s["id"] | "";
+    String name  = s["etidesStnName"] | s["name"] | "";
+    String state = s["state"] | "";
+    if (id.length() == 0 || name.length() == 0) continue;
+
+    String label = name + (state.length() > 0 ? ", " + state : "");
+    out += "<form method='POST' action='/save'>"
+           "<input type='hidden' name='station_id' value='" + id + "'>"
+           "<input type='hidden' name='station_name' value='" + label + "'>"
+           "<button class='btn station' type='submit'>"
+           "<strong>" + name + "</strong>"
+           "<small>" + state + " &mdash; ID: " + id + "</small>"
+           "</button></form>";
+    if (++count >= 20) break;
+  }
+
+  if (count == 0)
+    return "<p class='none'>No stations found for &ldquo;" + query + "&rdquo;.</p>";
+
+  return out;
+}
+
+void handleStations() {
+  if (!portalWifiConnected) {
+    server.sendHeader("Location", "/");
+    server.send(302);
+    return;
+  }
+
+  String query   = server.arg("q");
+  String results = "";
+  if (query.length() > 0) results = buildStationResults(query);
+
+  String html = "<!DOCTYPE html><html><head>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>MyTides Setup</title>";
+  html += PAGE_STYLE;
+  html += "</head><body>"
+    "<h1>MyTides Setup</h1>"
+    "<h2>Step 2 of 2 &mdash; Tide Station</h2>"
+    "<form method='GET' action='/stations'>"
+    "<label>Search for a tide station by name or city</label>"
+    "<input type='text' name='q' value='" + query + "' placeholder='e.g. Swansboro' autofocus>"
+    "<button class='btn' type='submit'>Search</button>"
+    "</form>"
+    + results +
+    "</body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+void handleSave() {
+  prefs.begin("mytides", false);
+  prefs.putString("ssid",         tempSSID);
+  prefs.putString("pass",         tempPass);
+  prefs.putString("station_id",   server.arg("station_id"));
+  prefs.putString("station_name", server.arg("station_name"));
+  prefs.end();
+
+  server.send(200, "text/html",
+    "<!DOCTYPE html><html><head>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Saved</title>"
+    + String(PAGE_STYLE) +
+    "</head><body style='text-align:center;padding-top:60px'>"
+    "<h1 style='color:#00cc44'>&#10003; Saved!</h1>"
+    "<p>Restarting MyTides...</p>"
+    "</body></html>");
+  delay(1500);
+  ESP.restart();
+}
+
+void startConfigPortal() {
+  // Update TFT after WiFi auto-connect attempt
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawCentreString("Setup Mode", tft.width() / 2, 15, 4);
+  if (portalWifiConnected) {
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.drawCentreString("WiFi Connected!", tft.width() / 2, 60, 4);
+  }
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawCentreString("Connect phone to WiFi:", tft.width() / 2, portalWifiConnected ? 105 : 65, 2);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawCentreString("MyTides-Config", tft.width() / 2, portalWifiConnected ? 123 : 83, 4);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawCentreString("Then open browser to:", tft.width() / 2, portalWifiConnected ? 163 : 123, 2);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.drawCentreString("192.168.4.1", tft.width() / 2, portalWifiConnected ? 181 : 141, 4);
+
+  WiFi.mode(WIFI_AP_STA);
+
+  // If credentials are saved, try connecting before the user has to re-enter them
+  if (hasConfig()) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawCentreString("Connecting to WiFi...", tft.width() / 2, tft.height() / 2, 2);
+    WiFi.begin(cfgSSID.c_str(), cfgPass.c_str());
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) { delay(500); attempts++; }
+    if (WiFi.status() == WL_CONNECTED) {
+      tempSSID = cfgSSID;
+      tempPass = cfgPass;
+      portalWifiConnected = true;
+    } else {
+      WiFi.disconnect();
+    }
+  }
+
+  WiFi.softAP("MyTides-Config");
+
+  // Captive portal DNS: answer every domain with our IP
+  dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
+
+  server.on("/",         HTTP_GET,  handleRoot);
+  server.on("/connect",  HTTP_POST, handleConnect);
+  server.on("/stations", HTTP_GET,  handleStations);
+  server.on("/save",     HTTP_POST, handleSave);
+
+  // Captive portal detection endpoints for iOS, Android, Windows, macOS
+  auto redirect = []() { server.sendHeader("Location", "http://192.168.4.1/"); server.send(302); };
+  server.on("/hotspot-detect.html",  HTTP_GET, redirect);
+  server.on("/library/test/success.html", HTTP_GET, redirect);
+  server.on("/generate_204",         HTTP_GET, redirect);
+  server.on("/gen_204",              HTTP_GET, redirect);
+  server.on("/ncsi.txt",             HTTP_GET, redirect);
+  server.on("/connecttest.txt",      HTTP_GET, redirect);
+  server.onNotFound(redirect);
+
+  server.begin();
+
+  while (true) {
+    dnsServer.processNextRequest();
+    server.handleClient();
+  }
+}
+
+// ── Config NVS helpers ────────────────────────────────────────────────────────
+
+void loadConfig() {
+  prefs.begin("mytides", true);
+  cfgSSID        = prefs.getString("ssid", "");
+  cfgPass        = prefs.getString("pass", "");
+  cfgStationId   = prefs.getString("station_id",   "8656613");
+  cfgStationName = prefs.getString("station_name", "Swansboro, NC");
+  prefs.end();
+}
+
+bool hasConfig() {
+  return cfgSSID.length() > 0 && cfgPass.length() > 0;
+}
+
+// ── WiFi / Time ───────────────────────────────────────────────────────────────
+
+void connectToWiFi() {
+  WiFi.begin(cfgSSID.c_str(), cfgPass.c_str());
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+    delay(500);
+    attempts++;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    tft.fillScreen(TFT_RED);
+    tft.setTextColor(TFT_WHITE, TFT_RED);
+    tft.drawCentreString("WiFi Failed!", tft.width() / 2, 40, 4);
+    tft.drawCentreString("Hold BOOT + press Reset", tft.width() / 2, 85, 2);
+    tft.drawCentreString("to reconfigure", tft.width() / 2, 105, 2);
+    while (true) delay(1000);
+  }
+}
+
+void initTime() {
+  configTime(0, 0, ntpServer);
+  setenv("TZ", timezone, 1);
+  tzset();
+  struct tm timeinfo;
+  int attempts = 0;
+  while (!getLocalTime(&timeinfo) && attempts < 20)
+    delay(500), attempts++;
+}
+
+// ── Tides ─────────────────────────────────────────────────────────────────────
+
+bool fetchTidePredictions(const String& datum) {
+  struct tm timeinfo;
+  getLocalTime(&timeinfo);
+  char dateBuffer[9];
+  strftime(dateBuffer, sizeof(dateBuffer), "%Y%m%d", &timeinfo);
+
+  // Subordinate/reference stations don't use a datum — omit the parameter when empty
+  String datumParam = datum.length() > 0 ? "&datum=" + datum : "";
+
+  String url = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?"
+               "product=predictions&application=web_services&station=" +
+               cfgStationId + "&begin_date=" + String(dateBuffer) +
+               "&end_date=" + String(dateBuffer) +
+               datumParam + "&units=english&time_zone=lst&format=json";
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.begin(client, url);
+  http.setTimeout(10000);
+  int httpCode = http.GET();
+
+  if (httpCode != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+
+  tideDoc.clear();
+  DeserializationError error = deserializeJson(tideDoc, http.getStream());
+  http.end();
+
+  if (error) return false;
+
+  // Check for NOAA API error in the response body
+  if (tideDoc.containsKey("error")) return false;
+
+  predictions = tideDoc["predictions"].as<JsonArray>();
+  return predictions.size() >= 3;
+}
+
+bool getTidePredictions() {
+  // Try datums in order; "" = no datum parameter (required for subordinate/reference stations)
+  const char* datums[] = { "MLLW", "STND", "MSL", "MTL", "IGLD", "MHHW", "" };
+  for (const char* datum : datums) {
+    if (fetchTidePredictions(datum)) return true;
+  }
+
+  // All datums failed — show the actual NOAA error message if available
+  tft.fillScreen(TFT_RED);
+  tft.setTextColor(TFT_WHITE, TFT_RED);
+  String msg = tideDoc["error"]["message"] | "No tide data for this station.";
+
+  // Word-wrap at ~34 chars per line (font 2 on 320px screen)
+  int y = 10;
+  while (msg.length() > 0 && y < 160) {
+    int cut = msg.length();
+    if (cut > 34) {
+      cut = msg.lastIndexOf(' ', 34);
+      if (cut <= 0) cut = 34;
+    }
+    tft.drawString(msg.substring(0, cut), 5, y, 2);
+    msg = (cut < (int)msg.length()) ? msg.substring(cut + 1) : "";
+    msg.trim();
+    y += 22;
+  }
+
+  tft.setTextColor(TFT_YELLOW, TFT_RED);
+  tft.drawString("Hold BOOT+Reset to", 5, y + 8, 2);
+  tft.drawString("pick a new station", 5, y + 28, 2);
+  return false;
+}
+
+void processTidePredictions() {
+  minTide = 10.0;
+  maxTide = -10.0;
+  highTideEvents[0] = ""; highTideEvents[1] = "";
+  lowTideEvents[0]  = ""; lowTideEvents[1]  = "";
+  int highTideCount = 0, lowTideCount = 0;
+
+  for (JsonObject p : predictions) {
+    float h = p["v"].as<float>();
+    if (h < minTide) minTide = h;
+    if (h > maxTide) maxTide = h;
+  }
+
+  int lastTrend = 0;
+  for (int i = 1; i < (int)predictions.size(); i++) {
+    float prev    = predictions[i - 1]["v"].as<float>();
+    float current = predictions[i]["v"].as<float>();
+    int trend = (current > prev) ? 1 : ((current < prev) ? -1 : lastTrend);
+
+    if (trend != lastTrend && lastTrend != 0) {
+      JsonObject peak = predictions[i - 1];
+      String t = peak["t"].as<String>();
+      int hour24 = t.substring(11, 13).toInt();
+      String mins = t.substring(14, 16);
+      int hour12 = (hour24 % 12 == 0) ? 12 : hour24 % 12;
+      String suffix = (hour24 < 12) ? "am" : "pm";
+      String label = String(hour12) + ":" + mins + suffix +
+                     " (" + String(peak["v"].as<float>(), 1) + "ft)";
+      if (lastTrend == 1 && highTideCount < 2) highTideEvents[highTideCount++] = label;
+      else if (lastTrend == -1 && lowTideCount < 2) lowTideEvents[lowTideCount++] = label;
+    }
+    lastTrend = trend;
+  }
+}
+
+void drawTideChart(const struct tm& timeinfo) {
+  tft.fillScreen(TFT_BLACK);
+
+  char displayDate[20];
+  strftime(displayDate, sizeof(displayDate), "%A, %b %d", &timeinfo);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawCentreString(displayDate, tft.width() / 2, 5, 4);
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  tft.drawCentreString(cfgStationName.c_str(), tft.width() / 2, 33, 2);
+
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString("High", 5, 45, 4);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(highTideEvents[0], 75, 50, 2);
+  if (highTideEvents[1] != "") tft.drawString(highTideEvents[1], 195, 50, 2);
+
+  tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
+  tft.drawString("Low ", 5, 80, 4);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(lowTideEvents[0], 75, 85, 2);
+  if (lowTideEvents[1] != "") tft.drawString(lowTideEvents[1], 195, 85, 2);
+
+  const int gX = 10, gY = 115;
+  const int gW = tft.width() - 20, gH = tft.height() - 125;
+  tft.drawRect(gX, gY, gW, gH, TFT_DARKGREY);
+
+  long minH = (long)(minTide * 100);
+  long maxH = (long)(maxTide * 100);
+  int lastX = -1, lastY = -1;
+  for (JsonObject p : predictions) {
+    String t = p["t"].as<String>();
+    int mins = t.substring(11, 13).toInt() * 60 + t.substring(14, 16).toInt();
+    int x = map(mins, 0, 1440, gX, gX + gW);
+    int y = map((long)(p["v"].as<float>() * 100), minH, maxH, gY + gH, gY);
+    if (lastX != -1) tft.drawLine(lastX, lastY, x, y, TFT_SKYBLUE);
+    lastX = x;
+    lastY = y;
+  }
+
+  int nowMins = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+  int nowX = map(nowMins, 0, 1440, gX, gX + gW);
+  tft.drawFastVLine(nowX, gY, gH, TFT_RED);
+}
+
+void fetchAndDisplayTides() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    tft.fillScreen(TFT_RED);
+    tft.setTextColor(TFT_WHITE, TFT_RED);
+    tft.drawString("Failed to get time!", 10, 10, 2);
+    return;
+  }
+
+  if (timeinfo.tm_yday != dataDayOfYear) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawCentreString("Fetching tide data...", tft.width() / 2, tft.height() / 2, 2);
+    if (getTidePredictions()) {
+      processTidePredictions();
+      dataDayOfYear = timeinfo.tm_yday;
+    } else {
+      return;
+    }
+  }
+
+  drawTideChart(timeinfo);
+}
+
+// ── Setup / Loop ──────────────────────────────────────────────────────────────
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(TFT_BL_PIN, OUTPUT);
+  digitalWrite(TFT_BL_PIN, HIGH);
+  pinMode(CONFIG_BTN, INPUT_PULLUP);
+
+  tft.init();
+  delay(100);
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+
+  loadConfig();
+
+  if (!hasConfig() || digitalRead(CONFIG_BTN) == LOW) {
+    startConfigPortal(); // never returns
+  }
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Connecting to WiFi...", 10, 10, 2);
+  connectToWiFi();
+  tft.fillRect(0, 0, tft.width(), 30, TFT_BLACK);
+
+  initTime();
+  delay(500);
+  fetchAndDisplayTides();
+}
+
+void loop() {
+  delay(15 * 60 * 1000);
+  fetchAndDisplayTides();
+}
