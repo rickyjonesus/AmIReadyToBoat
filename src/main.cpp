@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <SPI.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -9,10 +10,25 @@
 #include <TFT_eSPI.h>
 #include <time.h>
 
+// CYD touch SPI is on a SEPARATE bus from the display
+#define TOUCH_CLK  25
+#define TOUCH_MISO 39
+#define TOUCH_MOSI 32
+#define TOUCH_CS   33
+
+// Raw XPT2046 ADC ranges for CYD 2.8"
+// For landscape (rotation 1): raw Y axis → screen X, raw X axis (inverted) → screen Y
+#define TOUCH_X_MIN 200
+#define TOUCH_X_MAX 3900
+#define TOUCH_Y_MIN 200
+#define TOUCH_Y_MAX 3900
+
+SPIClass touchSPI(HSPI);
+
 #define TFT_BL_PIN  21
 #define CONFIG_BTN   0
 
-TFT_eSPI    tft = TFT_eSPI();
+TFT_eSPI tft = TFT_eSPI();
 Preferences prefs;
 WebServer   server(80);
 DNSServer   dnsServer;
@@ -23,6 +39,9 @@ String tempSSID, tempPass, connectError;
 
 // Saved config (loaded from NVS on normal boot)
 String cfgSSID, cfgPass, cfgStationId, cfgStationName;
+uint8_t cfgRotation = 1;
+
+unsigned long lastFetchMs = 0;
 
 const char* ntpServer = "pool.ntp.org";
 const char* timezone  = "EST5EDT,M3.2.0,M11.1.0";
@@ -327,6 +346,7 @@ void loadConfig() {
   cfgPass        = prefs.getString("pass", "");
   cfgStationId   = prefs.getString("station_id",   "8656613");
   cfgStationName = prefs.getString("station_name", "Swansboro, NC");
+  cfgRotation    = prefs.getUChar("rotation", 1);
   prefs.end();
 }
 
@@ -472,6 +492,136 @@ void processTidePredictions() {
   }
 }
 
+// ── Bare-metal XPT2046 touch driver ──────────────────────────────────────────
+// CYD touch is on its own SPI bus: CLK=25, MISO=39, MOSI=32, CS=33
+
+static uint16_t xptSample(uint8_t cmd) {
+  digitalWrite(TOUCH_CS, LOW);
+  touchSPI.transfer(cmd);
+  uint16_t val = ((uint16_t)touchSPI.transfer(0) << 8 | touchSPI.transfer(0)) >> 3;
+  digitalWrite(TOUCH_CS, HIGH);
+  return val & 0xFFF;
+}
+
+static int16_t xptZ() {
+  touchSPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
+  int16_t z = xptSample(0xB0); // Z1 pressure channel
+  touchSPI.endTransaction();
+  return z;
+}
+
+bool isTouched() { return xptZ() > 200; }
+
+bool getTouchPoint(uint16_t& sx, uint16_t& sy) {
+  touchSPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
+  int16_t z = xptSample(0xB0);
+  if (z < 200) { touchSPI.endTransaction(); return false; }
+
+  // Average 4 samples for stability
+  int32_t rawX = 0, rawY = 0;
+  for (int i = 0; i < 4; i++) {
+    rawX += xptSample(0xD0); // X channel
+    rawY += xptSample(0x90); // Y channel
+  }
+  touchSPI.endTransaction();
+  rawX /= 4; rawY /= 4;
+
+  if (rawX < 100 || rawX > 4000 || rawY < 100 || rawY > 4000) return false;
+
+  int W = tft.width(), H = tft.height();
+  switch (cfgRotation % 4) {
+    case 0:
+      sx = map(rawX, TOUCH_X_MIN, TOUCH_X_MAX, 0, W);
+      sy = map(rawY, TOUCH_Y_MAX, TOUCH_Y_MIN, 0, H);
+      break;
+    case 1: // Landscape (default): panel X → screen Y (inverted), panel Y → screen X
+      sx = map(rawY, TOUCH_Y_MIN, TOUCH_Y_MAX, 0, W);
+      sy = map(rawX, TOUCH_X_MAX, TOUCH_X_MIN, 0, H);
+      break;
+    case 2:
+      sx = map(rawX, TOUCH_X_MAX, TOUCH_X_MIN, 0, W);
+      sy = map(rawY, TOUCH_Y_MIN, TOUCH_Y_MAX, 0, H);
+      break;
+    case 3:
+      sx = map(rawY, TOUCH_Y_MAX, TOUCH_Y_MIN, 0, W);
+      sy = map(rawX, TOUCH_X_MIN, TOUCH_X_MAX, 0, H);
+      break;
+  }
+  sx = constrain(sx, 0, W - 1);
+  sy = constrain(sy, 0, H - 1);
+  return true;
+}
+
+void drawGear(int cx, int cy, uint16_t color) {
+  const int R = 10, r = 4, ts = 4;
+  tft.fillCircle(cx, cy, R, color);
+  tft.fillCircle(cx, cy, r, TFT_BLACK);
+  for (int i = 0; i < 6; i++) {
+    float a = i * (PI / 3.0f);
+    int tx = cx + (int)round(cos(a) * (R + 3));
+    int ty = cy + (int)round(sin(a) * (R + 3));
+    tft.fillRect(tx - ts / 2, ty - ts / 2, ts, ts, color);
+  }
+}
+
+void showRotationConfig() {
+  int W = tft.width(), H = tft.height();
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawCentreString("Display Rotation", W / 2, 8, 4);
+
+  const char* labels[] = {
+    "Portrait  (0)",
+    "Landscape  (90)",
+    "Portrait Flipped  (180)",
+    "Landscape Flipped  (270)"
+  };
+  const int btnH = 36, btnX = 10, btnW = W - 20;
+  int btnY[4];
+  for (int i = 0; i < 4; i++) {
+    btnY[i] = 46 + i * (btnH + 6);
+    bool cur = (i == (int)cfgRotation);
+    uint16_t bg = cur ? 0x07E0 : TFT_NAVY;
+    tft.fillRoundRect(btnX, btnY[i], btnW, btnH, 5, bg);
+    tft.drawRoundRect(btnX, btnY[i], btnW, btnH, 5, TFT_WHITE);
+    tft.setTextColor(TFT_WHITE, bg);
+    tft.drawCentreString(labels[i], W / 2, btnY[i] + 12, 2);
+  }
+
+  // Cancel button
+  int cancelY = H - 36;
+  tft.fillRoundRect(btnX, cancelY, btnW, 30, 5, TFT_DARKGREY);
+  tft.drawRoundRect(btnX, cancelY, btnW, 30, 5, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+  tft.drawCentreString("Cancel", W / 2, cancelY + 9, 2);
+
+  unsigned long lastTap = 0;
+  while (true) {
+    uint16_t tx, ty;
+    if (getTouchPoint(tx, ty) && millis() - lastTap > 400) {
+      lastTap = millis();
+
+      for (int i = 0; i < 4; i++) {
+        if (tx >= (uint16_t)btnX && tx <= (uint16_t)(btnX + btnW) &&
+            ty >= (uint16_t)btnY[i] && ty <= (uint16_t)(btnY[i] + btnH)) {
+          cfgRotation = i;
+          prefs.begin("mytides", false);
+          prefs.putUChar("rotation", cfgRotation);
+          prefs.end();
+          tft.setRotation(cfgRotation);
+          return;
+        }
+      }
+
+      if (tx >= (uint16_t)btnX && tx <= (uint16_t)(btnX + btnW) &&
+          ty >= (uint16_t)cancelY && ty <= (uint16_t)(cancelY + 30)) {
+        return;
+      }
+    }
+    delay(50);
+  }
+}
+
 void drawTideChart(const struct tm& timeinfo) {
   tft.fillScreen(TFT_BLACK);
 
@@ -514,6 +664,8 @@ void drawTideChart(const struct tm& timeinfo) {
   int nowMins = timeinfo.tm_hour * 60 + timeinfo.tm_min;
   int nowX = map(nowMins, 0, 1440, gX, gX + gW);
   tft.drawFastVLine(nowX, gY, gH, TFT_RED);
+
+  drawGear(tft.width() - 16, 16, TFT_DARKGREY);
 }
 
 void fetchAndDisplayTides() {
@@ -549,12 +701,16 @@ void setup() {
   digitalWrite(TFT_BL_PIN, HIGH);
   pinMode(CONFIG_BTN, INPUT_PULLUP);
 
+  loadConfig(); // must come before tft.init so saved rotation is ready
+
   tft.init();
   delay(100);
-  tft.setRotation(1);
+  tft.setRotation(cfgRotation);
   tft.fillScreen(TFT_BLACK);
 
-  loadConfig();
+  touchSPI.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
+  pinMode(TOUCH_CS, OUTPUT);
+  digitalWrite(TOUCH_CS, HIGH);
 
   if (!hasConfig() || digitalRead(CONFIG_BTN) == LOW) {
     startConfigPortal(); // never returns
@@ -568,9 +724,42 @@ void setup() {
   initTime();
   delay(500);
   fetchAndDisplayTides();
+  lastFetchMs = millis();
 }
 
 void loop() {
-  delay(15 * 60 * 1000);
-  fetchAndDisplayTides();
+  uint16_t mx = 0, my = 0;
+  if (getTouchPoint(mx, my)) {
+    // Debug overlay: show raw coords and a dot so we can verify mapping
+    touchSPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
+    int16_t rawX = xptSample(0xD0);
+    int16_t rawY = xptSample(0x90);
+    touchSPI.endTransaction();
+
+    int W = tft.width(), H = tft.height();
+    tft.fillRect(0, H - 18, W, 18, TFT_BLACK);
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    char dbg[48];
+    snprintf(dbg, sizeof(dbg), "raw(%d,%d) map(%d,%d)", rawX, rawY, mx, my);
+    tft.drawString(dbg, 4, H - 15, 1);
+    tft.fillCircle(mx, my, 4, TFT_RED);
+
+    int gx = W - 16, gy = 16;
+    if (abs((int)mx - gx) <= 30 && abs((int)my - gy) <= 30) {
+      while (isTouched()) delay(20);
+      showRotationConfig();
+      fetchAndDisplayTides();
+      lastFetchMs = millis();
+      return;
+    }
+
+    while (isTouched()) delay(20);
+  }
+
+  if (millis() - lastFetchMs >= 15UL * 60 * 1000) {
+    fetchAndDisplayTides();
+    lastFetchMs = millis();
+  }
+
+  delay(100);
 }
