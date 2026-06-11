@@ -728,7 +728,7 @@ void showGearMenu() {
           prefs.putBool("wifi_on", cfgWifiEnabled);
           prefs.end();
           if (cfgWifiEnabled) {
-            WiFi.begin(cfgSSID.c_str(), cfgPass.c_str());
+            dataDayOfYear = -1; // force immediate fetch on return
           } else {
             WiFi.disconnect(true);
             WiFi.mode(WIFI_OFF);
