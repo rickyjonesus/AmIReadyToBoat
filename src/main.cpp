@@ -694,7 +694,7 @@ void showGearMenu() {
     tft.fillRoundRect(btnX, wifiY, btnW, btnH, 5, wifiBg);
     tft.drawRoundRect(btnX, wifiY, btnW, btnH, 5, TFT_WHITE);
     tft.setTextColor(TFT_WHITE, wifiBg);
-    tft.drawCentreString(cfgWifiEnabled ? "WiFi: ON" : "WiFi: OFF", W / 2, wifiY + 12, 2);
+    tft.drawCentreString(cfgWifiEnabled ? "Auto Fetch: ON" : "Auto Fetch: OFF", W / 2, wifiY + 12, 2);
 
     // Cancel
     tft.fillRoundRect(btnX, cancelY, btnW, 30, 5, TFT_DARKGREY);
@@ -802,8 +802,9 @@ void fetchAndDisplayTides() {
   }
 
   if (timeinfo.tm_yday != dataDayOfYear) {
-    bool wakeWifi = !cfgWifiEnabled;
-    if (wakeWifi) {
+    if (!cfgWifiEnabled) return;
+
+    if (WiFi.status() != WL_CONNECTED) {
       tft.fillScreen(TFT_BLACK);
       tft.setTextColor(TFT_WHITE, TFT_BLACK);
       tft.drawCentreString("Updating tides...", tft.width() / 2, tft.height() / 2 - 14, 2);
@@ -822,10 +823,8 @@ void fetchAndDisplayTides() {
       }
     }
 
-    if (wakeWifi) {
-      WiFi.disconnect(true);
-      WiFi.mode(WIFI_OFF);
-    }
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
 
     if (dataDayOfYear != timeinfo.tm_yday) return;
   }
@@ -866,11 +865,6 @@ void setup() {
   delay(500);
   fetchAndDisplayTides();
   lastFetchMs = millis();
-
-  if (!cfgWifiEnabled) {
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-  }
 }
 
 void loop() {
