@@ -1,3 +1,50 @@
+/*
+ * MyTides — tide display for Swansboro, NC on CYD (ESP32-2432S028)
+ *
+ * HARDWARE
+ *   Board : ESP32-2432S028 (Cheap Yellow Display)
+ *   Screen: 2.8" ILI9341V SPI TFT, 320x240 landscape
+ *
+ *   Display SPI  CLK=14  MISO=12  MOSI=13  CS=15  DC=2  BL=21
+ *   Touch SPI    CLK=25  MISO=39  MOSI=32  CS=33        IRQ=36 (unused)
+ *
+ *   IMPORTANT: touch is on a COMPLETELY SEPARATE SPI bus from the display.
+ *   Using display pins (14/12/13) for touch produces zero response.
+ *   Touch uses SPIClass(HSPI) on pins 25/39/32/33.
+ *
+ * TFT_eSPI (build_flags)
+ *   -DUSER_SETUP_LOADED   required — suppresses default User_Setup.h
+ *   -DILI9341_2_DRIVER    must be _2_ variant (not ILI9341_DRIVER); it's the V display
+ *   -DSPI_FREQUENCY=27000000  55 MHz causes white screen on this unit
+ *   delay(100) after tft.init() is required before any drawing
+ *   After changing build_flags always run PlatformIO Clean before rebuilding
+ *
+ * TOUCH DRIVER
+ *   Bare-metal XPT2046 over SPIClass(HSPI). TFT_eSPI built-in touch and the
+ *   paulstoffregen/XPT2046_Touchscreen library both failed (wrong SPI bus assumed).
+ *   XPT2046 commands: 0xD0=X  0x90=Y  0xB0=Z1 pressure
+ *   Landscape mapping: raw-Y (inverted) -> screen-X, raw-X -> screen-Y
+ *   Adjust TOUCH_X_MIN/MAX and TOUCH_Y_MIN/MAX if taps are consistently off.
+ *
+ * CONFIG PORTAL
+ *   Hold BOOT (GPIO 0) on power-up -> AP "MyTides-Config" -> browser 192.168.4.1
+ *   Station search: tidesandcurrents.noaa.gov/mdapi/latest/webapi/tidepredstations.json?q=<query>
+ *   NVS namespace "mytides": ssid, pass, station_id, station_name, rotation
+ *
+ * NOAA TIDE API
+ *   api.tidesandcurrents.noaa.gov/api/prod/datagetter?product=predictions&...
+ *   Subordinate stations (e.g. Swansboro 8656613) reject the datum parameter.
+ *   Code tries MLLW->STND->MSL->MTL->IGLD->MHHW->"" (empty = omit datum).
+ *
+ * TIME
+ *   configTime(0,0,"pool.ntp.org") + setenv("TZ","EST5EDT,M3.2.0,M11.1.0",1)
+ *   POSIX TZ string handles DST automatically; fixed UTC offsets do not.
+ *
+ * GEAR ICON / ROTATION
+ *   Tapping gear (upper-right corner) opens rotation config screen.
+ *   Choice saved to NVS key "rotation" and applied on next boot.
+ */
+
 #include <Arduino.h>
 #include <SPI.h>
 #include <WiFi.h>
@@ -40,6 +87,7 @@ String tempSSID, tempPass, connectError;
 // Saved config (loaded from NVS on normal boot)
 String cfgSSID, cfgPass, cfgStationId, cfgStationName;
 uint8_t cfgRotation = 1;
+bool    cfgWifiEnabled = true;
 
 unsigned long lastFetchMs = 0;
 
@@ -347,6 +395,7 @@ void loadConfig() {
   cfgStationId   = prefs.getString("station_id",   "8656613");
   cfgStationName = prefs.getString("station_name", "Swansboro, NC");
   cfgRotation    = prefs.getUChar("rotation", 1);
+  cfgWifiEnabled = prefs.getBool("wifi_on", true);
   prefs.end();
 }
 
@@ -530,21 +579,21 @@ bool getTouchPoint(uint16_t& sx, uint16_t& sy) {
 
   int W = tft.width(), H = tft.height();
   switch (cfgRotation % 4) {
-    case 0:
-      sx = map(rawX, TOUCH_X_MIN, TOUCH_X_MAX, 0, W);
-      sy = map(rawY, TOUCH_Y_MAX, TOUCH_Y_MIN, 0, H);
-      break;
-    case 1: // Landscape (default): panel X → screen Y (inverted), panel Y → screen X
-      sx = map(rawY, TOUCH_Y_MIN, TOUCH_Y_MAX, 0, W);
-      sy = map(rawX, TOUCH_X_MAX, TOUCH_X_MIN, 0, H);
-      break;
-    case 2:
+    case 0: // Portrait
       sx = map(rawX, TOUCH_X_MAX, TOUCH_X_MIN, 0, W);
       sy = map(rawY, TOUCH_Y_MIN, TOUCH_Y_MAX, 0, H);
       break;
-    case 3:
-      sx = map(rawY, TOUCH_Y_MAX, TOUCH_Y_MIN, 0, W);
+    case 1: // Landscape (default, confirmed working)
+      sx = map(rawY, TOUCH_Y_MIN, TOUCH_Y_MAX, 0, W);
       sy = map(rawX, TOUCH_X_MIN, TOUCH_X_MAX, 0, H);
+      break;
+    case 2: // Portrait flipped — 180° from portrait
+      sx = map(rawX, TOUCH_X_MIN, TOUCH_X_MAX, 0, W);
+      sy = map(rawY, TOUCH_Y_MAX, TOUCH_Y_MIN, 0, H);
+      break;
+    case 3: // Landscape flipped — 180° from landscape
+      sx = map(rawY, TOUCH_Y_MAX, TOUCH_Y_MIN, 0, W);
+      sy = map(rawX, TOUCH_X_MAX, TOUCH_X_MIN, 0, H);
       break;
   }
   sx = constrain(sx, 0, W - 1);
@@ -616,6 +665,81 @@ void showRotationConfig() {
       if (tx >= (uint16_t)btnX && tx <= (uint16_t)(btnX + btnW) &&
           ty >= (uint16_t)cancelY && ty <= (uint16_t)(cancelY + 30)) {
         return;
+      }
+    }
+    delay(50);
+  }
+}
+
+void showGearMenu() {
+  int W = tft.width(), H = tft.height();
+  const int btnH = 36, btnX = 10, btnW = W - 20;
+  int cancelY = H - 36;
+
+  auto drawMenu = [&]() {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawCentreString("Settings", W / 2, 8, 4);
+
+    // Orientation
+    int orientY = 46;
+    tft.fillRoundRect(btnX, orientY, btnW, btnH, 5, TFT_NAVY);
+    tft.drawRoundRect(btnX, orientY, btnW, btnH, 5, TFT_WHITE);
+    tft.setTextColor(TFT_WHITE, TFT_NAVY);
+    tft.drawCentreString("Orientation", W / 2, orientY + 12, 2);
+
+    // WiFi toggle
+    int wifiY = 46 + btnH + 6;
+    uint16_t wifiBg = cfgWifiEnabled ? 0x03E0 : 0x7800; // green : dark red
+    tft.fillRoundRect(btnX, wifiY, btnW, btnH, 5, wifiBg);
+    tft.drawRoundRect(btnX, wifiY, btnW, btnH, 5, TFT_WHITE);
+    tft.setTextColor(TFT_WHITE, wifiBg);
+    tft.drawCentreString(cfgWifiEnabled ? "WiFi: ON" : "WiFi: OFF", W / 2, wifiY + 12, 2);
+
+    // Cancel
+    tft.fillRoundRect(btnX, cancelY, btnW, 30, 5, TFT_DARKGREY);
+    tft.drawRoundRect(btnX, cancelY, btnW, 30, 5, TFT_WHITE);
+    tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+    tft.drawCentreString("Cancel", W / 2, cancelY + 9, 2);
+  };
+
+  drawMenu();
+
+  int orientY = 46;
+  int wifiY   = 46 + btnH + 6;
+
+  unsigned long lastTap = 0;
+  while (true) {
+    uint16_t tx, ty;
+    if (getTouchPoint(tx, ty) && millis() - lastTap > 400) {
+      lastTap = millis();
+
+      if (tx >= (uint16_t)btnX && tx <= (uint16_t)(btnX + btnW)) {
+        if (ty >= (uint16_t)orientY && ty <= (uint16_t)(orientY + btnH)) {
+          while (isTouched()) delay(20);
+          showRotationConfig();
+          return;
+        }
+
+        if (ty >= (uint16_t)wifiY && ty <= (uint16_t)(wifiY + btnH)) {
+          while (isTouched()) delay(20);
+          cfgWifiEnabled = !cfgWifiEnabled;
+          prefs.begin("mytides", false);
+          prefs.putBool("wifi_on", cfgWifiEnabled);
+          prefs.end();
+          if (cfgWifiEnabled) {
+            WiFi.begin(cfgSSID.c_str(), cfgPass.c_str());
+          } else {
+            WiFi.disconnect(true);
+            WiFi.mode(WIFI_OFF);
+          }
+          drawMenu();
+          continue;
+        }
+
+        if (ty >= (uint16_t)cancelY && ty <= (uint16_t)(cancelY + 30)) {
+          return;
+        }
       }
     }
     delay(50);
@@ -730,24 +854,11 @@ void setup() {
 void loop() {
   uint16_t mx = 0, my = 0;
   if (getTouchPoint(mx, my)) {
-    // Debug overlay: show raw coords and a dot so we can verify mapping
-    touchSPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE0));
-    int16_t rawX = xptSample(0xD0);
-    int16_t rawY = xptSample(0x90);
-    touchSPI.endTransaction();
-
     int W = tft.width(), H = tft.height();
-    tft.fillRect(0, H - 18, W, 18, TFT_BLACK);
-    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    char dbg[48];
-    snprintf(dbg, sizeof(dbg), "raw(%d,%d) map(%d,%d)", rawX, rawY, mx, my);
-    tft.drawString(dbg, 4, H - 15, 1);
-    tft.fillCircle(mx, my, 4, TFT_RED);
-
     int gx = W - 16, gy = 16;
     if (abs((int)mx - gx) <= 30 && abs((int)my - gy) <= 30) {
       while (isTouched()) delay(20);
-      showRotationConfig();
+      showGearMenu();
       fetchAndDisplayTides();
       lastFetchMs = millis();
       return;
