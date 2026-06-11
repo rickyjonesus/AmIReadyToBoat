@@ -802,15 +802,32 @@ void fetchAndDisplayTides() {
   }
 
   if (timeinfo.tm_yday != dataDayOfYear) {
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.drawCentreString("Fetching tide data...", tft.width() / 2, tft.height() / 2, 2);
-    if (getTidePredictions()) {
-      processTidePredictions();
-      dataDayOfYear = timeinfo.tm_yday;
-    } else {
-      return;
+    bool wakeWifi = !cfgWifiEnabled;
+    if (wakeWifi) {
+      tft.fillScreen(TFT_BLACK);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawCentreString("Updating tides...", tft.width() / 2, tft.height() / 2 - 14, 2);
+      WiFi.begin(cfgSSID.c_str(), cfgPass.c_str());
+      int attempts = 0;
+      while (WiFi.status() != WL_CONNECTED && attempts < 20) { delay(500); attempts++; }
     }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      tft.fillScreen(TFT_BLACK);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawCentreString("Fetching tide data...", tft.width() / 2, tft.height() / 2, 2);
+      if (getTidePredictions()) {
+        processTidePredictions();
+        dataDayOfYear = timeinfo.tm_yday;
+      }
+    }
+
+    if (wakeWifi) {
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+    }
+
+    if (dataDayOfYear != timeinfo.tm_yday) return;
   }
 
   drawTideChart(timeinfo);
@@ -849,6 +866,11 @@ void setup() {
   delay(500);
   fetchAndDisplayTides();
   lastFetchMs = millis();
+
+  if (!cfgWifiEnabled) {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+  }
 }
 
 void loop() {
