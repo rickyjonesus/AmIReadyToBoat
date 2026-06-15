@@ -100,7 +100,14 @@ JsonArray    predictions;
 float        minTide, maxTide;
 String       highTideEvents[2];
 String       lowTideEvents[2];
-int          dataDayOfYear = -1;
+int          cachedHourOffset = -9999;
+int          cachedTodayDoy  = -1;
+int          hourOffset      = 0;  // hours from today's midnight; swipe shifts by 1
+static int16_t drawPred[500];      // tide heights ×100 for offline-safe chart drawing
+static int     drawPredCount = 0;
+static int     drawPredStart = 0;  // absolute minute of drawPred[0]
+static bool    wifiOffline   = false;
+static time_t  cachedWStart  = 0;  // Unix time of window start when data was last fetched
 
 // Forward declarations
 bool hasConfig();
@@ -405,21 +412,13 @@ bool hasConfig() {
 
 // ── WiFi / Time ───────────────────────────────────────────────────────────────
 
-void connectToWiFi() {
+bool connectToWiFi() {
   WiFi.begin(cfgSSID.c_str(), cfgPass.c_str());
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+  for (int i = 0; i < 40; i++) {
+    if (WiFi.status() == WL_CONNECTED) return true;
     delay(500);
-    attempts++;
   }
-  if (WiFi.status() != WL_CONNECTED) {
-    tft.fillScreen(TFT_RED);
-    tft.setTextColor(TFT_WHITE, TFT_RED);
-    tft.drawCentreString("WiFi Failed!", tft.width() / 2, 40, 4);
-    tft.drawCentreString("Hold BOOT + press Reset", tft.width() / 2, 85, 2);
-    tft.drawCentreString("to reconfigure", tft.width() / 2, 105, 2);
-    while (true) delay(1000);
-  }
+  return false;
 }
 
 void initTime() {
@@ -435,18 +434,30 @@ void initTime() {
 // ── Tides ─────────────────────────────────────────────────────────────────────
 
 bool fetchTidePredictions(const String& datum) {
-  struct tm timeinfo;
-  getLocalTime(&timeinfo);
-  char dateBuffer[9];
-  strftime(dateBuffer, sizeof(dateBuffer), "%Y%m%d", &timeinfo);
+  struct tm now;
+  getLocalTime(&now);
+  struct tm midTm = now;
+  midTm.tm_hour = midTm.tm_min = midTm.tm_sec = 0;
+  midTm.tm_isdst = -1;
+  time_t midnight = mktime(&midTm);
+
+  // 24-hour window starting at hourOffset hours from today's midnight
+  time_t wStart = midnight + (time_t)hourOffset * 3600;
+  time_t wEnd   = wStart + 86400;
+  struct tm sTm, eTm;
+  localtime_r(&wStart, &sTm);
+  localtime_r(&wEnd,   &eTm);
+  char sDate[9], eDate[9];
+  strftime(sDate, sizeof(sDate), "%Y%m%d", &sTm);
+  strftime(eDate, sizeof(eDate), "%Y%m%d", &eTm);
 
   // Subordinate/reference stations don't use a datum — omit the parameter when empty
   String datumParam = datum.length() > 0 ? "&datum=" + datum : "";
 
   String url = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter?"
                "product=predictions&application=web_services&station=" +
-               cfgStationId + "&begin_date=" + String(dateBuffer) +
-               "&end_date=" + String(dateBuffer) +
+               cfgStationId + "&begin_date=" + String(sDate) +
+               "&end_date=" + String(eDate) +
                datumParam + "&units=english&time_zone=lst&format=json";
 
   WiFiClientSecure client;
@@ -506,7 +517,29 @@ bool getTidePredictions() {
   return false;
 }
 
+// Returns minutes since today's midnight for a NOAA timestamp "YYYY-MM-DD HH:MM"
+static int predAbsMin(const String& ts, time_t midnight) {
+  struct tm t = {};
+  t.tm_year  = ts.substring(0, 4).toInt() - 1900;
+  t.tm_mon   = ts.substring(5, 7).toInt() - 1;
+  t.tm_mday  = ts.substring(8, 10).toInt();
+  t.tm_hour  = ts.substring(11, 13).toInt();
+  t.tm_min   = ts.substring(14, 16).toInt();
+  t.tm_isdst = -1;
+  return (int)((mktime(&t) - midnight) / 60);
+}
+
 void processTidePredictions() {
+  struct tm now;
+  getLocalTime(&now);
+  struct tm midTm = now;
+  midTm.tm_hour = midTm.tm_min = midTm.tm_sec = 0;
+  midTm.tm_isdst = -1;
+  time_t midnight = mktime(&midTm);
+
+  int winStart = hourOffset * 60;
+  int winEnd   = winStart + 1440;
+
   minTide = 10.0;
   maxTide = -10.0;
   highTideEvents[0] = ""; highTideEvents[1] = "";
@@ -514,6 +547,8 @@ void processTidePredictions() {
   int highTideCount = 0, lowTideCount = 0;
 
   for (JsonObject p : predictions) {
+    int am = predAbsMin(p["t"].as<String>(), midnight);
+    if (am < winStart || am >= winEnd) continue;
     float h = p["v"].as<float>();
     if (h < minTide) minTide = h;
     if (h > maxTide) maxTide = h;
@@ -521,6 +556,10 @@ void processTidePredictions() {
 
   int lastTrend = 0;
   for (int i = 1; i < (int)predictions.size(); i++) {
+    int am0 = predAbsMin(predictions[i - 1]["t"].as<String>(), midnight);
+    int am1 = predAbsMin(predictions[i]["t"].as<String>(), midnight);
+    if (am1 < winStart || am0 >= winEnd) { lastTrend = 0; continue; }
+
     float prev    = predictions[i - 1]["v"].as<float>();
     float current = predictions[i]["v"].as<float>();
     int trend = (current > prev) ? 1 : ((current < prev) ? -1 : lastTrend);
@@ -728,7 +767,7 @@ void showGearMenu() {
           prefs.putBool("wifi_on", cfgWifiEnabled);
           prefs.end();
           if (cfgWifiEnabled) {
-            dataDayOfYear = -1; // force immediate fetch on return
+            cachedHourOffset = -9999; // force immediate fetch on return
           } else {
             WiFi.disconnect(true);
             WiFi.mode(WIFI_OFF);
@@ -746,11 +785,89 @@ void showGearMenu() {
   }
 }
 
+// Wifi-off icon: dot + 3 upward arcs + red slash, centred at (cx, cy)
+void drawWifiOffIcon(int cx, int cy) {
+  const uint16_t gray = 0x8410;
+  tft.fillCircle(cx, cy, 2, gray);
+  const float a0 = PI * 7.0f / 6.0f;   // 210°
+  const float a1 = PI * 11.0f / 6.0f;  // 330° — arc goes upward in screen coords
+  int radii[3] = { 5, 8, 11 };
+  for (int ri = 0; ri < 3; ri++) {
+    int r = radii[ri];
+    for (float a = a0; a <= a1; a += 0.15f)
+      tft.drawPixel(cx + (int)round(cos(a) * r), cy + (int)round(sin(a) * r), gray);
+  }
+  tft.drawLine(cx - 8, cy - 11, cx + 7, cy + 4, TFT_RED);
+  tft.drawLine(cx - 7, cy - 11, cx + 8, cy + 4, TFT_RED);
+}
+
+// Populate drawPred[] from the live predictions JSON array after a successful fetch
+static void populateDrawPred(time_t midnight) {
+  drawPredCount = 0;
+  bool first = true;
+  for (JsonObject p : predictions) {
+    if (drawPredCount >= 500) break;
+    int am = predAbsMin(p["t"].as<String>(), midnight);
+    if (first) { drawPredStart = am; first = false; }
+    drawPred[drawPredCount++] = (int16_t)(p["v"].as<float>() * 100.0f);
+  }
+}
+
+static void saveTideCache() {
+  prefs.begin("tideCache", false);
+  prefs.putFloat("minT",    minTide);
+  prefs.putFloat("maxT",    maxTide);
+  prefs.putString("hi0",    highTideEvents[0]);
+  prefs.putString("hi1",    highTideEvents[1]);
+  prefs.putString("lo0",    lowTideEvents[0]);
+  prefs.putString("lo1",    lowTideEvents[1]);
+  prefs.putInt("pStart",    drawPredStart);
+  prefs.putInt("nPred",     drawPredCount);
+  prefs.putInt("hourOff",   hourOffset);
+  prefs.putUInt("wStart",   (uint32_t)cachedWStart);
+  prefs.putBytes("pVals",   drawPred, drawPredCount * sizeof(int16_t));
+  prefs.end();
+}
+
+static bool loadTideCache() {
+  prefs.begin("tideCache", true);
+  int n = prefs.getInt("nPred", 0);
+  if (n == 0) { prefs.end(); return false; }
+  drawPredCount     = min(n, 500);
+  drawPredStart     = prefs.getInt("pStart", 0);
+  hourOffset        = prefs.getInt("hourOff", 0);
+  minTide           = prefs.getFloat("minT", 0.0f);
+  maxTide           = prefs.getFloat("maxT", 1.0f);
+  highTideEvents[0] = prefs.getString("hi0", "");
+  highTideEvents[1] = prefs.getString("hi1", "");
+  lowTideEvents[0]  = prefs.getString("lo0", "");
+  lowTideEvents[1]  = prefs.getString("lo1", "");
+  cachedWStart      = (time_t)prefs.getUInt("wStart", 0);
+  prefs.getBytes("pVals", drawPred, drawPredCount * sizeof(int16_t));
+  prefs.end();
+  return true;
+}
+
 void drawTideChart(const struct tm& timeinfo) {
+  // Compute today's midnight for absolute-minute calculations
+  struct tm midTm = timeinfo;
+  midTm.tm_hour = midTm.tm_min = midTm.tm_sec = 0;
+  midTm.tm_isdst = -1;
+  time_t midnight = mktime(&midTm);
+
+  int winStart = hourOffset * 60;
+  int winEnd   = winStart + 1440;
+
   tft.fillScreen(TFT_BLACK);
 
+  // Date header: use the cached window-start time when offline (NTP may be wrong)
+  time_t wStartT = (wifiOffline && cachedWStart != 0)
+                   ? cachedWStart
+                   : midnight + (time_t)hourOffset * 3600;
+  struct tm wStartTm;
+  localtime_r(&wStartT, &wStartTm);
   char displayDate[20];
-  strftime(displayDate, sizeof(displayDate), "%A, %b %d", &timeinfo);
+  strftime(displayDate, sizeof(displayDate), "%A, %b %d", &wStartTm);
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
   tft.drawCentreString(displayDate, tft.width() / 2, 5, 4);
   tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
@@ -775,21 +892,27 @@ void drawTideChart(const struct tm& timeinfo) {
   long minH = (long)(minTide * 100);
   long maxH = (long)(maxTide * 100);
   int lastX = -1, lastY = -1;
-  for (JsonObject p : predictions) {
-    String t = p["t"].as<String>();
-    int mins = t.substring(11, 13).toInt() * 60 + t.substring(14, 16).toInt();
-    int x = map(mins, 0, 1440, gX, gX + gW);
-    int y = map((long)(p["v"].as<float>() * 100), minH, maxH, gY + gH, gY);
+  for (int i = 0; i < drawPredCount; i++) {
+    int am = drawPredStart + i * 6;
+    if (am < winStart || am >= winEnd) { lastX = -1; continue; }
+    int x = map(am, winStart, winEnd, gX, gX + gW);
+    int y = map((long)drawPred[i], minH, maxH, gY + gH, gY);
     if (lastX != -1) tft.drawLine(lastX, lastY, x, y, TFT_SKYBLUE);
     lastX = x;
     lastY = y;
   }
 
-  int nowMins = timeinfo.tm_hour * 60 + timeinfo.tm_min;
-  int nowX = map(nowMins, 0, 1440, gX, gX + gW);
-  tft.drawFastVLine(nowX, gY, gH, TFT_RED);
+  // "Now" line only when online (offline data is stale)
+  if (!wifiOffline) {
+    int nowAbsMin = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+    if (nowAbsMin >= winStart && nowAbsMin < winEnd) {
+      int nowX = map(nowAbsMin, winStart, winEnd, gX, gX + gW);
+      tft.drawFastVLine(nowX, gY, gH, TFT_RED);
+    }
+  }
 
   drawGear(tft.width() - 16, 16, TFT_DARKGREY);
+  if (wifiOffline) drawWifiOffIcon(16, 16);
 }
 
 void fetchAndDisplayTides() {
@@ -801,8 +924,11 @@ void fetchAndDisplayTides() {
     return;
   }
 
-  if (timeinfo.tm_yday != dataDayOfYear) {
-    if (!cfgWifiEnabled) return;
+  if (hourOffset != cachedHourOffset || timeinfo.tm_yday != cachedTodayDoy) {
+    if (!cfgWifiEnabled) {
+      drawTideChart(timeinfo);
+      return;
+    }
 
     if (WiFi.status() != WL_CONNECTED) {
       tft.fillScreen(TFT_BLACK);
@@ -813,20 +939,34 @@ void fetchAndDisplayTides() {
       while (WiFi.status() != WL_CONNECTED && attempts < 20) { delay(500); attempts++; }
     }
 
+    bool fetched = false;
     if (WiFi.status() == WL_CONNECTED) {
       tft.fillScreen(TFT_BLACK);
       tft.setTextColor(TFT_WHITE, TFT_BLACK);
       tft.drawCentreString("Fetching tide data...", tft.width() / 2, tft.height() / 2, 2);
       if (getTidePredictions()) {
         processTidePredictions();
-        dataDayOfYear = timeinfo.tm_yday;
+        struct tm midTm = timeinfo;
+        midTm.tm_hour = midTm.tm_min = midTm.tm_sec = 0;
+        midTm.tm_isdst = -1;
+        time_t midnight = mktime(&midTm);
+        cachedWStart = midnight + (time_t)hourOffset * 3600;
+        populateDrawPred(midnight);
+        saveTideCache();
+        cachedHourOffset = hourOffset;
+        cachedTodayDoy   = timeinfo.tm_yday;
+        wifiOffline = false;
+        fetched = true;
       }
     }
 
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
 
-    if (dataDayOfYear != timeinfo.tm_yday) return;
+    if (!fetched) {
+      wifiOffline = true;
+      if (drawPredCount == 0) return;  // no data at all — stay on loading screen
+    }
   }
 
   drawTideChart(timeinfo);
@@ -858,7 +998,23 @@ void setup() {
 
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.drawString("Connecting to WiFi...", 10, 10, 2);
-  connectToWiFi();
+  if (!connectToWiFi()) {
+    wifiOffline = true;
+    tft.fillScreen(TFT_BLACK);
+    struct tm timeinfo = {};
+    getLocalTime(&timeinfo);
+    if (loadTideCache()) {
+      drawTideChart(timeinfo);
+    } else {
+      tft.setTextColor(TFT_RED, TFT_BLACK);
+      tft.drawCentreString("No WiFi", tft.width() / 2, tft.height() / 2 - 20, 4);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.drawCentreString("No cached data available", tft.width() / 2, tft.height() / 2 + 10, 2);
+      tft.drawCentreString("Hold BOOT + Reset to reconfigure", tft.width() / 2, tft.height() / 2 + 30, 2);
+    }
+    lastFetchMs = millis();
+    return;
+  }
   tft.fillRect(0, 0, tft.width(), 30, TFT_BLACK);
 
   initTime();
@@ -868,19 +1024,40 @@ void setup() {
 }
 
 void loop() {
+  static uint16_t touchDownX = 0, touchDownY = 0;
+  static uint16_t touchLastX = 0;
+  static bool touchActive = false;
+
   uint16_t mx = 0, my = 0;
-  if (getTouchPoint(mx, my)) {
-    int W = tft.width(), H = tft.height();
-    int gx = W - 16, gy = 16;
-    if (abs((int)mx - gx) <= 30 && abs((int)my - gy) <= 30) {
-      while (isTouched()) delay(20);
-      showGearMenu();
+  bool touched = getTouchPoint(mx, my);
+
+  if (touched) {
+    if (!touchActive) {
+      touchDownX = mx;
+      touchDownY = my;
+      touchActive = true;
+    }
+    touchLastX = mx;
+  } else if (touchActive) {
+    touchActive = false;
+    int deltaX = (int)touchLastX - (int)touchDownX;
+
+    if (abs(deltaX) > 50) {
+      // Swipe: left = next hour, right = previous hour
+      hourOffset += (deltaX < 0) ? 1 : -1;
+      hourOffset = constrain(hourOffset, -168, 168);
       fetchAndDisplayTides();
       lastFetchMs = millis();
-      return;
+    } else {
+      // Tap: check gear icon
+      int W = tft.width();
+      int gx = W - 16, gy = 16;
+      if (abs((int)touchDownX - gx) <= 30 && abs((int)touchDownY - gy) <= 30) {
+        showGearMenu();
+        fetchAndDisplayTides();
+        lastFetchMs = millis();
+      }
     }
-
-    while (isTouched()) delay(20);
   }
 
   if (millis() - lastFetchMs >= 15UL * 60 * 1000) {
